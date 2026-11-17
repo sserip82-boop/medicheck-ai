@@ -24,6 +24,13 @@ class ScanReport:
     lookup_error: str = ''
     lookup_status: str = 'NOT_ATTEMPTED'
     source: str = 'Gemini OCR / 제품 동일성 미확인'
+    seller: str = ''
+    combined_company: str = ''
+    manufacturer_evidence: str = ''
+    seller_evidence: str = ''
+    combined_evidence: str = ''
+    manufacturer_verified: bool = True  # direct/explicitly user-entered records; OCR overrides this flag
+    company_role: str = 'unknown'
 
     @property
     def claims_text(self) -> str:
@@ -32,6 +39,26 @@ class ScanReport:
 
 def _clean(value: Any, limit=300) -> str:
     return str(value or '').strip()[:limit]
+
+
+def effective_manufacturer(report: ScanReport) -> str:
+    """Seller-only labels are NEVER manufacturer evidence."""
+    return report.manufacturer if report.manufacturer_verified else ''
+
+
+def candidate_matches(report: ScanReport, product: Product):
+    return assess_product_match(product, report.product_name, effective_manufacturer(report), report.report_no)
+
+
+def recommended_candidate(report: ScanReport) -> Product | None:
+    """Recommend ONE candidate only if a strong verified identity uniquely points to it.
+
+    Recommendation is NOT confirmation; app must still ask the user.
+    """
+    strong = [p for p in report.products if candidate_matches(report,p).level in ('REPORT','NAME_MAKER')]
+    if len(strong)==1:
+        return strong[0]
+    return None
 
 
 def _sort_candidates(items: list[Product], name: str, maker: str, number: str) -> list[Product]:
@@ -59,7 +86,7 @@ def lookup_products(report: ScanReport, food_key: str, searcher: Callable=search
         # 신고번호 우선 검색; 조회 후 모든 후보에 대해 일치 여부를 별도 확인합니다.
         matches, status = searcher(food_key, '' if report.report_no else report.product_name,
                                    report.report_no, '')
-        report.products = _sort_candidates(matches, report.product_name, report.manufacturer, report.report_no)
+        report.products = _sort_candidates(matches, report.product_name, effective_manufacturer(report), report.report_no)
         report.lookup_status = status or 'INFO-000'
     except DataLookupError as exc:
         report.lookup_error = str(exc)
@@ -81,6 +108,13 @@ def scan_one_photo(data: bytes, gemini_key: str, food_key: str,
         report_no=_clean(extracted.get('report_no'), 50),
         claim_candidates=claims,
         full_text=_clean(extracted.get('full_text'), 9000),
+        seller=_clean(extracted.get('seller'),120),
+        combined_company=_clean(extracted.get('combined_company'),120),
+        manufacturer_evidence=_clean(extracted.get('manufacturer_evidence'),250),
+        seller_evidence=_clean(extracted.get('seller_evidence'),250),
+        combined_evidence=_clean(extracted.get('combined_evidence'),250),
+        manufacturer_verified=bool(extracted.get('manufacturer_verified', True)),
+        company_role=_clean(extracted.get('company_role') or 'unknown',40),
     )
     return lookup_products(report, food_key, searcher=searcher)
 
@@ -94,6 +128,6 @@ def selected_result(report: ScanReport, product: Product|None, confirmed: bool) 
     """Human must verify that photographed package AND advertisement are same item."""
     if product is None:
         return make_preliminary_result(report)
-    match = assess_product_match(product, report.product_name, report.manufacturer, report.report_no)
+    match = candidate_matches(report, product)
     link_confirmed = bool(confirmed and match.sufficient_for_claim_comparison)
     return evaluate_ad(report.claims_text, product, link_confirmed)

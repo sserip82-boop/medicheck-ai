@@ -17,7 +17,7 @@ from engine import I0030_DOC_URL, date_display
 from match_utils import assess_product_match
 from senior_ui import build_spoken_summary, render_voice_player
 from vision import DEFAULT_GEMINI_MODEL, ALLOWED_GEMINI_MODELS
-from workflow import scan_one_photo, lookup_products, selected_result
+from workflow import scan_one_photo, lookup_products, selected_result, recommended_candidate, candidate_matches
 
 st.set_page_config(page_title='메디체크 AI | 사진으로 확인', page_icon='🛡️',
                    layout='centered', initial_sidebar_state='collapsed')
@@ -62,6 +62,7 @@ if gemini_model not in ALLOWED_GEMINI_MODELS:
 for key, default in {
     'photo_fingerprint':None, 'scan_report':None, 'last_scanned_hash':None,
     'last_scan_at':-1., 'scan_calls':0, 'edit_revision':0,
+    'confirmed_record':None, 'show_alternatives':False, 'rejected_candidate':None,
 }.items():
     if key not in st.session_state:
         st.session_state[key]=default
@@ -99,6 +100,9 @@ if st.session_state['photo_fingerprint']!=fingerprint:
     st.session_state['scan_report']=None
     st.session_state['last_scanned_hash']=None
     st.session_state['edit_revision']+=1
+    st.session_state['confirmed_record']=None
+    st.session_state['show_alternatives']=False
+    st.session_state['rejected_candidate']=None
 
 if photo:
     st.caption(f'선택한 사진: {photo.name} · {len(photo.getvalue())/1024/1024:.1f}MB')
@@ -145,34 +149,101 @@ def render_report(report):
 
     products=report.products
     selected=None
+    suggested=recommended_candidate(report)
+    if suggested and st.session_state.get('rejected_candidate')==suggested.report_no:
+        suggested=None
+
+    if report.manufacturer_evidence:
+        st.caption('사진에서 찾은 업체 표시: '+report.manufacturer_evidence)
+    elif report.seller_evidence:
+        st.info('사진에서 판매원만 확인했습니다: '+report.seller_evidence+'\n\n판매원은 제조사와 다를 수 있어 업체명을 다시 확인해야 합니다.')
+
     if products:
-        if len(products)==1:
+        if suggested is not None:
+            selected=suggested
+            st.info('사진에 적힌 업체명과 제품명(또는 신고번호)에 맞는 **유력한 공식 기록**을 찾았어요. 같은 제품인지는 직접 확인해 주세요.')
+            st.markdown('#### 사진과 같은 제품인가요?')
+            with st.container(border=True):
+                st.markdown('**'+suggested.product_name+'**')
+                st.write('공식 제조업체: '+suggested.maker)
+                st.caption('품목제조번호: '+suggested.report_no)
+                if st.button('✅ 네, 포장과 같은 제품이에요',key='agree_recommend',use_container_width=True):
+                    st.session_state['confirmed_record']=suggested.report_no
+                if st.button('아니에요 · 다른 제품 찾기',key='reject_recommend',use_container_width=True):
+                    st.session_state['confirmed_record']=None
+                    st.session_state['rejected_candidate']=suggested.report_no
+                    st.session_state['show_alternatives']=True
+                    st.rerun()
+        elif len(products)==1:
             selected=products[0]
-            st.info(f'식약처 조회 후보: {selected.product_name} · {selected.maker}')
+            st.info('공식 조회 후보: '+selected.product_name+' · '+selected.maker+' (동일 제품 여부는 미확인)')
         else:
-            st.warning(f'이름이 비슷한 공식 기록이 {len(products)}건 검색되었습니다. 포장에 적힌 제품과 제조사를 보고 선택해 주세요.')
-            choice=st.selectbox('실제 포장과 일치하는 제품을 선택하세요',
-                options=list(range(len(products))),index=None,placeholder='제품을 선택해 주세요',
-                format_func=lambda i: f'{products[i].product_name} | {products[i].maker} | {products[i].report_no}')
-            if choice is not None:
-                selected=products[choice]
+            st.info(f'비슷한 이름의 식약처 공식 기록 {len(products)}건이 검색됐어요. **제품명을 기준으로 임의 확정하지 않습니다.**')
     elif report.lookup_error:
         st.info('공식 제품 확인: '+report.lookup_error)
     else:
-        st.info('공식 제품 기록이 검색되지 않았습니다. 검색되지 않았다고 가짜 제품이라는 뜻은 아닙니다.')
+        st.info('식약처 공식 제품을 찾지 못했어요. 검색되지 않았다고 가짜 제품이라는 뜻은 아닙니다.')
+
+    # Simple, source-aware fallback. Seller-only text must not be used as manufacturer proof.
+    if products and not report.manufacturer_verified and not report.report_no:
+        st.markdown('#### 포장에 적힌 업체를 확인해 주세요')
+        st.caption('제품명만으로는 같은 제품인지 알 수 없어요. 아래는 사진에 실제로 적힌 내용을 입력하는 칸입니다.')
+        with st.form(f'company_quick_{st.session_state["edit_revision"]}'):
+            company_input=st.text_input('포장에 적힌 업체명',value=report.seller or '',placeholder='예: (주)씨스팡')
+            company_role=st.radio('사진에 어떤 이름으로 적혀 있나요?',
+                ['제조원 · 제조업체','제조 및 판매원','판매원만 표시'],horizontal=False,index=None)
+            company_submit=st.form_submit_button('이 업체명으로 제품 다시 확인',use_container_width=True)
+        if company_submit:
+            if not company_input.strip() or not company_role:
+                st.warning('업체명과 사진에 표시된 역할을 모두 확인해 주세요.')
+            else:
+                st.session_state['confirmed_record']=None
+                st.session_state['rejected_candidate']=None
+                st.session_state['show_alternatives']=False
+                company=company_input.strip()
+                if company_role=='판매원만 표시':
+                    report.seller=company
+                    report.seller_evidence='사용자가 사진의 판매원 표기를 확인하여 입력함'
+                    report.manufacturer=''
+                    report.manufacturer_verified=False
+                    report.company_role='seller'
+                else:
+                    report.manufacturer=company
+                    report.manufacturer_verified=True
+                    report.manufacturer_evidence='사용자가 포장에 표시된 '+company_role+'을 직접 확인하여 입력함'
+                    report.company_role='combined' if company_role=='제조 및 판매원' else 'manufacturer'
+                st.session_state['scan_report']=report
+                st.session_state['edit_revision']+=1
+                # No extra food API call: current candidate list can be matched locally.
+                st.rerun()
+
+    if len(products)>1 and (suggested is None or st.session_state['show_alternatives']):
+        with st.expander('다른 공식 검색 결과에서 직접 선택하기',expanded=suggested is None):
+            choice=st.selectbox('포장과 같은 제품이 있나요?',
+                options=list(range(len(products))),index=None,placeholder='다른 제품 선택',
+                format_func=lambda i:f'{products[i].product_name} | {products[i].maker} | {products[i].report_no}',
+                key=f'candidate_v171_{st.session_state["edit_revision"]}')
+            if choice is not None:
+                selected=products[choice]
 
     confirmed=False
     match=None
     if selected:
-        match=assess_product_match(selected,report.product_name,report.manufacturer,report.report_no)
+        match=candidate_matches(report, selected)
         if match.sufficient_for_claim_comparison:
-            st.caption(match.label+' · '+match.details)
-            confirmed=st.checkbox(
-                '사진에 나온 제품과 이 공식 기록이 같은 제품임을 확인했습니다.',
-                key=f'confirm_{st.session_state["edit_revision"]}_{selected.report_no}')
+            if suggested is None or selected.report_no!=suggested.report_no:
+                st.caption('공식 기록과 사진 속 업체정보 비교: '+match.label)
+                if st.button('✅ 네, 선택한 공식 기록이 사진 속 제품과 같아요',
+                             key=f'confirm_alt_{st.session_state["edit_revision"]}_{selected.report_no}',
+                             use_container_width=True):
+                    st.session_state['confirmed_record']=selected.report_no
+            confirmed=st.session_state.get('confirmed_record')==selected.report_no
+            if confirmed:
+                st.success('제품명과 업체정보를 대조하고 사용자가 동일한 제품임을 확인했어요.')
+            else:
+                st.warning('이 제품인지 아직 확인하지 않았어요. 포장 정보를 직접 대조해 주세요.')
         else:
             st.warning('제품 확인이 더 필요합니다. '+match.details)
-
     if report.claim_candidates:
         result=selected_result(report,selected,confirmed)
         if result['overall']=='CAUTION':
@@ -212,11 +283,20 @@ def render_report(report):
         if submitted:
             report.product_name=name.strip()
             report.manufacturer=maker.strip()
+            report.manufacturer_verified=bool(maker.strip())
+            report.company_role='user_confirmed' if maker.strip() else 'unknown'
+            report.manufacturer_evidence='사용자가 사진의 제조원 표기를 확인하여 수정함' if maker.strip() else ''
+            report.seller=''
+            report.seller_evidence=''
+            report.combined_company=''
             report.report_no=number.strip()
             report.claim_candidates=[x.strip() for x in claims.splitlines() if x.strip()][:12]
             lookup_products(report,food_key)
             st.session_state['scan_report']=report
             st.session_state['edit_revision']+=1
+            st.session_state['confirmed_record']=None
+            st.session_state['show_alternatives']=False
+            st.session_state['rejected_candidate']=None
             st.rerun()
         with st.expander('사진에서 읽은 전체 글자 보기'):
             st.text_area('OCR 원문',value=report.full_text,height=160,disabled=True)
@@ -235,4 +315,4 @@ with st.expander('서비스 이용 안내 / 분석 결과의 한계'):
     st.write('• 실시간 조회 실패 시 오래된 시연용 데이터로 자동 전환하지 않습니다.')
     st.write('• 세션별·서버 프로세스별 간단한 요청 제한이 있지만 완전한 남용 방지 기능은 아닙니다. Google API 요금·할당량도 제한해야 합니다.')
 
-st.caption('메디체크 AI MVP v1.7 · 카카오 AI 루키캠프 학생 프로젝트 · 결과는 참고용입니다.')
+st.caption('메디체크 AI MVP v1.7.1 · 카카오 AI 루키캠프 학생 프로젝트 · 결과는 참고용입니다.')
